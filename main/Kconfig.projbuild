@@ -38,6 +38,29 @@ menu "Pi link"
         default 500
         range 10 10000
 
+    config APP_RL_GUARD_GETUP_CUR_MA
+        int "Guard in get-up mode: current limit (mA), 0 = off"
+        default 1000
+        range 0 5000
+        help
+            Replaces APP_RL_GUARD_CUR_MA while the latest SET_ALL carries the
+            GETUP flag (bit 3). Getting up from the ground holds joints near
+            stall for longer than walking does. STATE flag GETUP (bit 9)
+            reports that the get-up mode is in use. 0 turns the current guard
+            off in get-up mode: no time above a limit is counted there, and
+            walking starts counting from zero after it. The temperature guard
+            stays on in both modes. Otherwise at least 100 mA.
+
+    config APP_RL_GUARD_GETUP_CUR_MS
+        int "Guard in get-up mode: time above the current limit (ms)"
+        default 1000
+        range 10 10000
+        help
+            Replaces APP_RL_GUARD_CUR_MS in get-up mode. The time counted
+            above the limit carries over a change of mode, except that
+            leaving get-up mode after at least this long in it restarts it.
+            Unused while APP_RL_GUARD_GETUP_CUR_MA is 0.
+
     config APP_RL_GUARD_TEMP_DC
         int "Guard: housing temperature limit (0.1 degC)"
         default 600

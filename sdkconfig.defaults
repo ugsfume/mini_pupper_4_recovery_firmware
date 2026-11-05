@@ -15,3 +15,9 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_FREERTOS_HZ=1000
+
+# No current guard in get-up mode (SET_ALL flag GETUP); the walking current
+# guard and the temperature guard stay on
+CONFIG_APP_RL_GUARD_GETUP_CUR_MA=0
+# Walking current guard, above the 1000 mA default, so hand shoves do not trip it
+CONFIG_APP_RL_GUARD_CUR_MA=1500

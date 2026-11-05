@@ -1,9 +1,28 @@
-# mp4link · `mp4link-sku2` branch: the ESP32-S3 as a servo link for a Raspberry Pi
+# mp4link · `mini-pupper-4-getup` branch: the ESP32-S3 as a servo link for a Raspberry Pi, with a get-up mode
 
 A controller on the robot's Raspberry Pi 5 (for example a walking policy trained in simulation) drives
 the twelve servos directly: the Pi sends twelve targets, and the ESP32-S3 answers every 5 ms with the
 positions, currents, temperatures and the IMU. The ESP32 runs nothing else. The branch is for
 SKU2: the Mini Pupper v4 with a Raspberry Pi 5.
+
+## What this branch changes
+
+Against `mp4link-sku2`:
+
+| | `mp4link-sku2` | this branch |
+|---|---|---|
+| Current guard, walking | 1000 mA for 0.5 s | 1500 mA for 0.5 s |
+| Current guard, get-up mode (`SET_ALL` flag GETUP) | no such mode | **none** |
+| Temperature guard, both modes | 60 °C for 1 s | 60 °C for 1 s |
+| Calibration offsets | up to ±45° | up to ±90° |
+
+**Risk:** get-up mode has no current guard. A servo can stay near stall until the temperature cut-out
+trips (housing above 60 °C for 1 s), and the housing lags the winding, so a winding can overheat
+first. The host must watch the currents and stop on its own.
+
+`tools/pi` is the same as on `mp4link-sku2`: it never sets GETUP, and `calib` refuses stored offsets
+beyond ±45°. The matching host tools, with get-up mode and ±90° offsets, are in the
+`mini_pupper_4_recovery` repository.
 
 ## Related branches
 
@@ -12,7 +31,8 @@ SKU2: the Mini Pupper v4 with a Raspberry Pi 5.
 | `main` | the full firmware: gait, app, face, voice, agent, Raspberry Pi link |
 | `rl` | the RL walk on the ESP32-S3, nothing else |
 | `micro-ros` | micro-ROS and an LD06 lidar |
-| **`mp4link-sku2`** (this one) | the servo link for a controller on the Raspberry Pi (SKU2) |
+| `mp4link-sku2` | the servo link for a controller on the Raspberry Pi (SKU2) |
+| **`mini-pupper-4-getup`** (this one) | the same link, with a get-up mode and wider limits |
 
 The wiring is the same as `main`'s, so switching branches only needs a reflash. The frames are also the
 ones `main` serves in its Pi link sessions (`main/pi/rl_link.cc`); the Pi tools here follow that session
@@ -57,19 +77,24 @@ On the Pi this is `/dev/ttyAMA0` at 921 600 baud: add `dtparam=uart0=on` to
    Expect `STATE` at about 200 Hz, 0 CRC errors, `IMU ok` and fresh feedback from all four boards.
 3. **Configure the servos** after every power-up (RAM only): `python3 -m mp4link config`.
 
-The console (UART0, the USB port) prints the boot log at 115 200 baud.
+The console (UART0, the USB port) prints the boot log at 115 200 baud; its link line ends in
+`guard 1500 mA / 500 ms, get-up guard off`.
 
 ## Behaviour
 
 - Every servo is IDLE at boot and whenever the link is disarmed.
 - Armed, each 5 ms tick sends the latest `SET_ALL` targets to the four servo boards.
 - **Link watchdog:** no `SET_ALL` for 100 ms → every servo IDLE.
-- **Guards:** a driven servo above 1000 mA for 0.5 s, or a housing above 60 °C for 1 s, or a silent servo
-  board → every servo IDLE, latched until the host clears it.
+- **Guards:** a driven servo above 1500 mA for 0.5 s, or a housing above 60 °C for 1 s, or a silent servo
+  board → every servo IDLE, latched until the host clears it. In get-up mode (`SET_ALL` flag GETUP) the
+  current guard is off by default (`APP_RL_GUARD_GETUP_CUR_MA` = 0 in `sdkconfig.defaults`; a value of
+  100 or more sets a get-up limit for `APP_RL_GUARD_GETUP_CUR_MS`): getting up holds joints near stall,
+  and the host watches the currents. The temperature guard stays on in both modes.
 - **Task watchdog:** if the tick stalls for 500 ms, the ESP32 reboots and idles every board.
-- **Calibration offsets** stay in NVS (namespace `parameter`, keys `offset1`..`offset12`, degrees). The ESP32
-  stores and serves them; the host applies them. The `main` branch's firmware keeps its own copy (namespace
-  `robot`), takes `parameter`'s only while its own offsets are all zero, and writes both when it saves: after
+- **Calibration offsets** stay in NVS (namespace `parameter`, keys `offset1`..`offset12`, degrees, at most
+  ±90°: stand codes 214..808 of 0..1023). The ESP32 stores and serves them; the host applies them. The
+  `main` branch's firmware keeps its own copy (namespace `robot`), takes `parameter`'s only while its own
+  offsets are all zero, and writes both when it saves: after
   switching to `main`, check the stand pose and recalibrate there if it is off.
 
 The limits are build options (`idf.py menuconfig` → Pi link). To use the protocol on the USB port as

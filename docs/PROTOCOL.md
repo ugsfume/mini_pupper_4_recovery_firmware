@@ -32,7 +32,7 @@ response  62 cmd servo status pos_dd:u16 cur_mA:i16 val:f32 crc:u16
 | 9 RAW_REPLY | the board's next raw reply: `val` packs the count of 0xFF bytes and the first three bytes | refused |
 | 11 GET_STATUS | `val` = the servo's status word | refused |
 | 12 GET_OFFSET | `val` = the servo's calibration offset, degrees (status 7 if none is stored) | refused |
-| 13 SET_OFFSET | `arg1 \| arg2<<16` = float offset, \|offset\| ≤ 45°, into RAM; `val` = read-back | refused |
+| 13 SET_OFFSET | `arg1 \| arg2<<16` = float offset, \|offset\| ≤ 90°, into RAM; `val` = read-back | refused |
 | 14 SAVE_OFFSETS | any servo id: writes every offset set in RAM to NVS; `val` = how many | refused |
 
 Status: 0 OK, 1 bad servo, 2 bad argument, 3 board did not answer, 5 unknown command, 6 refused,
@@ -51,7 +51,7 @@ Responses go to the port the request came from.
 | 0 | magic `0x43` | u8 |
 | 1 | version `1` | u8 |
 | 2 | seq | u16 |
-| 4 | flags: bit 0 ARM, bit 1 DISARM, bit 2 CLEAR | u16 |
+| 4 | flags: bit 0 ARM, bit 1 DISARM, bit 2 CLEAR, bit 3 GETUP | u16 |
 | 6 | enable: bit i = servo i+1 in position mode, otherwise IDLE | u16 |
 | 8 | current cap, mA (in AT32 control_mode 1 a duty cap: duty ≤ min(max_pwm, kff × cap)) | u16 |
 | 10 | 12 × position | u16 |
@@ -64,6 +64,9 @@ watchdog, records `seq`, and makes its port the `STATE` port.
   `WATCHDOG` and `REJECTED`.
 - CLEAR: clears every latched flag first (so CLEAR | ARM re-arms after a fault).
 - Without ARM, a frame updates the targets; they move servos only while armed.
+- GETUP: the current guard uses its get-up limits while the latest `SET_ALL` carries this bit
+  (Behaviour, Guard). Every `SET_ALL` sets the mode, so a host in get-up mode sets the bit on
+  every frame.
 
 ## STATE (ESP32 → host, 106 bytes, every tick = 200 Hz)
 
@@ -87,7 +90,8 @@ watchdog, records `seq`, and makes its port the `STATE` port.
 
 Flags: bit 0 ARMED; bit 1 WATCHDOG (latched); bit 2 FAULT_CUR (latched); bit 3 FAULT_TEMP
 (latched); bit 4 FAULT_BOARD (latched); bit 5 IMU_OK; bit 6 BOARD_MISSING (this tick); bit 7
-REJECTED (latched); bit 8 the STATE port is USB (`APP_RL_USB_LINK`).
+REJECTED (latched); bit 8 the STATE port is USB (`APP_RL_USB_LINK`); bit 9 GETUP (this tick's
+current guard used the get-up limits).
 
 A servo whose board did not answer reads 0 in position, current and temperature. A board whose
 `boards` bit is clear this tick reports its previous feedback (older than `t_us` says): the reply
@@ -100,8 +104,16 @@ last good sample is older than 20 ms.
 - Each tick sends one frame to each of the four boards: the targets of enabled servos while armed,
   IDLE for the rest.
 - **Watchdog:** armed and no `SET_ALL` for 100 ms → disarm, `WATCHDOG`.
-- **Guard** (only servos driven by `SET_ALL`, dwell in elapsed time): |current| above 1000 mA
-  (`APP_RL_GUARD_CUR_MA`) for 0.5 s → `FAULT_CUR`; housing above 60.0 °C for 1 s → `FAULT_TEMP`
+- **Guard** (only servos driven by `SET_ALL`, dwell in elapsed time): |current| above 1500 mA
+  (`APP_RL_GUARD_CUR_MA` in `sdkconfig.defaults`, `_MS`) for 0.5 s → `FAULT_CUR`. In get-up mode the current guard
+  is off on this branch (`APP_RL_GUARD_GETUP_CUR_MA` = 0 in `sdkconfig.defaults`): no time
+  above a limit is counted while the latest `SET_ALL` carries `GETUP`, and walking counts from
+  zero after it; the host watches the currents. Built with a get-up limit instead (at least
+  100 mA, for `_GETUP_CUR_MS`), get-up mode trips above it; the time counted above the current
+  limit then carries over a change of mode, except that leaving get-up mode after at least
+  `_GETUP_CUR_MS` in it restarts it: a host switching modes more often cannot restart it.
+  The boot log ends in "get-up guard off" or "get-up N mA / M ms".
+  Housing above 60.0 °C for 1 s → `FAULT_TEMP`
   (a backstop: the housing lags the winding); an enabled servo's board silent for more than
   20 ticks (100 ms at 200 Hz) → `FAULT_BOARD`. Each disarms and names the servo. Temperature
   readings of 150 °C or more are ignored as invalid.
@@ -134,3 +146,7 @@ both; this firmware answers either at once.
 
 The `main` branch's firmware answers `GET_OFFSET` for a servo with no stored offset with status 0
 and `val` 0, not status 7.
+
+The `main` branch's firmware has no get-up mode: a `SET_ALL` with GETUP does not open a session
+there, inside a session the bit is ignored, and `STATE` never reports GETUP. A host that needs
+the get-up limits checks for GETUP in `STATE` before relying on them.

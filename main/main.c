@@ -13,7 +13,8 @@
  * crc field:
  *   request  10 B  42 cmd servo pad arg1 arg2 crc   per-servo setup commands
  *   response 14 B  62 cmd servo status pos cur val crc
- *   SET_ALL  36 B  43 ...  twelve targets, enable mask, arm / disarm / clear
+ *   SET_ALL  36 B  43 ...  twelve targets, enable mask, arm / disarm / clear,
+ *                          get-up mode
  *   STATE   106 B  63 ...  every tick: twelve positions, currents and
  *                          temperatures, the IMU, flags
  *
@@ -75,6 +76,12 @@ static const char *TAG = "mp4link";
 #define WDOG_US       ((int64_t)CONFIG_APP_RL_WATCHDOG_MS * 1000)
 #define GUARD_CUR_MA  CONFIG_APP_RL_GUARD_CUR_MA
 #define GUARD_CUR_US  ((int64_t)CONFIG_APP_RL_GUARD_CUR_MS * 1000)
+#define GETUP_CUR_MA  CONFIG_APP_RL_GUARD_GETUP_CUR_MA   /* the current guard in get-up mode; 0 = off */
+#define GETUP_CUR_US  ((int64_t)CONFIG_APP_RL_GUARD_GETUP_CUR_MS * 1000)
+#if GETUP_CUR_MA != 0 && GETUP_CUR_MA < 100
+#error "APP_RL_GUARD_GETUP_CUR_MA: 0 (off) or at least 100 mA"
+#endif
+#define GETUP_GUARD_OFF (GETUP_CUR_MA == 0)
 #define GUARD_TEMP_DC CONFIG_APP_RL_GUARD_TEMP_DC
 #define GUARD_TEMP_US ((int64_t)CONFIG_APP_RL_GUARD_TEMP_MS * 1000)
 #define BOARD_LOST_TICKS 20   /* an enabled servo's board silent this long -> fault */
@@ -126,6 +133,7 @@ _Static_assert(sizeof(state_t) == 106, "state_t size");
 #define SA_ARM     (1u << 0)
 #define SA_DISARM  (1u << 1)
 #define SA_CLEAR   (1u << 2)   /* clear latched faults and the watchdog flag */
+#define SA_GETUP   (1u << 3)   /* get-up mode: the current guard uses the GETUP limits */
 
 /* STATE flags */
 #define ST_ARMED         (1u << 0)
@@ -137,6 +145,7 @@ _Static_assert(sizeof(state_t) == 106, "state_t size");
 #define ST_BOARD_MISSING (1u << 6)   /* this tick: a board did not answer */
 #define ST_REJECTED      (1u << 7)   /* latched: an ARM refused while a fault was latched */
 #define ST_HOST_USB      (1u << 8)   /* STATE goes to UART0 (APP_RL_USB_LINK) */
+#define ST_GETUP         (1u << 9)   /* this tick's current guard used the get-up limits */
 #define ST_LATCHED (ST_WATCHDOG | ST_FAULT_CUR | ST_FAULT_TEMP | ST_FAULT_BOARD | ST_REJECTED)
 #define ST_FAULTS  (ST_FAULT_CUR | ST_FAULT_TEMP | ST_FAULT_BOARD)
 
@@ -157,7 +166,7 @@ enum {
 #define RSP_ERR_NVS     8   /* NVS unavailable, or a write failed */
 
 /* ---- calibration offsets (see the header) ----------------------------------- */
-#define OFFSET_MAX_DEG  45.0f
+#define OFFSET_MAX_DEG  90.0f   /* stand code 511 +- 297 (214..808), far from 0 and 1023 */
 static SemaphoreHandle_t s_off_lock;
 static nvs_handle_t s_nvs;
 static bool  s_nvs_ok;
@@ -218,6 +227,7 @@ static struct {
     uint8_t     fault_servo;
     uint16_t    seq, enable, cur_cap;
     uint16_t    pos_dd[12];
+    bool        getup;          /* SA_GETUP of the latest SET_ALL */
     int64_t     last_set_all_us;
     uart_port_t state_port;
 } s_ctl = { .state_port = HOST_PORT };
@@ -407,6 +417,7 @@ static void handle_set_all(uart_port_t port, const set_all_t *f)
     s_ctl.seq             = f->seq;
     s_ctl.enable          = f->enable & 0x0FFF;
     s_ctl.cur_cap         = f->cur_cap_mA;
+    s_ctl.getup           = (f->flags & SA_GETUP) != 0;
     memcpy(s_ctl.pos_dd, f->pos_dd, sizeof s_ctl.pos_dd);
     if (f->flags & SA_CLEAR) {
         s_ctl.latched = 0;
@@ -510,6 +521,8 @@ static void tick_task(void *arg)
     uint32_t tick = 0;
     int64_t  t_prev = esp_timer_get_time();
     bool     imu_ok = false;
+    bool     getup_prev = false;
+    int64_t  getup_since = 0;   /* when get-up mode last began */
     state_t  st;
 
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
@@ -525,6 +538,7 @@ static void tick_task(void *arg)
             disarm_locked(ST_WATCHDOG, 0);
         bool        armed  = s_ctl.armed;
         uint16_t    enable = s_ctl.enable, cap = s_ctl.cur_cap, seq = s_ctl.seq;
+        bool        getup  = s_ctl.getup;
         uart_port_t port   = s_ctl.state_port;
         memcpy(target, s_ctl.pos_dd, sizeof target);
         portEXIT_CRITICAL(&s_mux);
@@ -543,7 +557,26 @@ static void tick_task(void *arg)
         uint8_t answered = 0, fresh = 0;
         driver_board_sync(mode, pos, cur, &answered, &fresh);
 
-        /* the guard: only servos driven this tick */
+        /* the guard: only servos driven this tick. A get-up runs near stall
+         * for longer than walking, so SA_GETUP selects its own current limit
+         * and time. The current timers carry over a change of mode, with one
+         * exception: leaving get-up mode after at least the get-up time in it
+         * restarts them, so a get-up does not hand back to walking with time
+         * counted under the longer limit (more than the walking time would
+         * trip at once). A host switching modes more often than that never
+         * restarts a timer, so a current held above the limit still trips.
+         * With APP_RL_GUARD_GETUP_CUR_MA 0 the current guard is off in get-up
+         * mode: nothing is counted there, and walking counts from zero after
+         * it. The temperature guard runs in both modes. */
+        const int     cur_ma = getup ? GETUP_CUR_MA : GUARD_CUR_MA;
+        const int64_t cur_us = getup ? GETUP_CUR_US : GUARD_CUR_US;
+        if (getup != getup_prev) {
+            if (getup)
+                getup_since = now;
+            else if (now - getup_since >= GETUP_CUR_US)
+                for (int i = 0; i < 12; i++) over_cur_us[i] = 0;
+            getup_prev = getup;
+        }
         uint16_t trip = 0;
         uint8_t  trip_servo = 0;
         for (int i = 0; i < 12; i++) {
@@ -553,11 +586,12 @@ static void tick_task(void *arg)
             if (!valid) continue;
             int c = driver_board_present_cur_mA(i + 1);
             if (c < 0) c = -c;
-            over_cur_us[i] = (c > GUARD_CUR_MA) ? over_cur_us[i] + dt : 0;
+            if (getup && GETUP_GUARD_OFF) over_cur_us[i] = 0;
+            else over_cur_us[i] = (c > cur_ma) ? over_cur_us[i] + dt : 0;
             int16_t t = (int16_t)(driver_board_present_res(i + 1) & 0xFFFFu);
             bool hot = t > GUARD_TEMP_DC && t < 1500;   /* above 150 degC is not a temperature */
             over_temp_us[i] = hot ? over_temp_us[i] + dt : 0;
-            if (!trip && over_cur_us[i] > GUARD_CUR_US)   { trip = ST_FAULT_CUR;  trip_servo = (uint8_t)(i + 1); }
+            if (!trip && over_cur_us[i] > cur_us)         { trip = ST_FAULT_CUR;  trip_servo = (uint8_t)(i + 1); }
             if (!trip && over_temp_us[i] > GUARD_TEMP_US) { trip = ST_FAULT_TEMP; trip_servo = (uint8_t)(i + 1); }
         }
         for (int b = 0; b < 4; b++) {
@@ -593,6 +627,7 @@ static void tick_task(void *arg)
                    | (armed ? ST_ARMED : 0)
                    | (imu_ok ? ST_IMU_OK : 0)
                    | (answered != 0x0F ? ST_BOARD_MISSING : 0)
+                   | (getup ? ST_GETUP : 0)
 #if CONFIG_APP_RL_USB_LINK
                    | (port == USB_PORT ? ST_HOST_USB : 0)
 #endif
@@ -657,9 +692,16 @@ void app_main(void)
     uart_wait_tx_done(USB_PORT, pdMS_TO_TICKS(200));
     uart_set_baudrate(USB_PORT, USB_BAUD);
 #else
-    ESP_LOGI(TAG, "Pi link UART%d %d baud (TX IO%d, RX IO%d), tick %d Hz, guard %d mA / %d ms",
+#if GETUP_GUARD_OFF
+    ESP_LOGI(TAG, "Pi link UART%d %d baud (TX IO%d, RX IO%d), tick %d Hz, guard %d mA / %d ms, get-up guard off",
              (int)HOST_PORT, HOST_BAUD, (int)HOST_TX, (int)HOST_RX, CONFIG_APP_RL_TICK_HZ,
              CONFIG_APP_RL_GUARD_CUR_MA, CONFIG_APP_RL_GUARD_CUR_MS);
+#else
+    ESP_LOGI(TAG, "Pi link UART%d %d baud (TX IO%d, RX IO%d), tick %d Hz, guard %d mA / %d ms, get-up %d mA / %d ms",
+             (int)HOST_PORT, HOST_BAUD, (int)HOST_TX, (int)HOST_RX, CONFIG_APP_RL_TICK_HZ,
+             CONFIG_APP_RL_GUARD_CUR_MA, CONFIG_APP_RL_GUARD_CUR_MS,
+             CONFIG_APP_RL_GUARD_GETUP_CUR_MA, CONFIG_APP_RL_GUARD_GETUP_CUR_MS);
+#endif
 #endif
 
     uart_open(HOST_PORT, HOST_TX, HOST_RX, HOST_BAUD);
